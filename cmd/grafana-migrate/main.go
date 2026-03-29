@@ -89,6 +89,7 @@ func main() {
 	}
 
 	// Import the now-sanitized dump file into Postgres
+	log.Infoln("🚚 Importing dump file to Postgres (this may take a while)")
 	if err := db.ImportDump(dumpPath); err != nil {
 		log.Fatalf("❌ %v - failed to import dump file to Postgres.", err)
 	}
