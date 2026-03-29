@@ -122,11 +122,22 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 		}
 	}
 
-	// Alter tables because of boolean issues
-	// SQLite has booleans as 1's and 0's
-	// Postgres is true/false
-	// We'll convert it after importing the dump.
-	if errorEncountered := db.prepareTables(); errorEncountered == true {
+	// Auto-detect boolean columns in PostgreSQL that need temporary integer conversion
+	// because SQLite stores booleans as 0/1 integers.
+	boolCols, err := db.detectBooleanColumns()
+	if err != nil {
+		return fmt.Errorf("failed to detect boolean columns: %w", err)
+	}
+	db.log.Debugf("Detected %d boolean columns requiring integer conversion", len(boolCols))
+	for _, col := range boolCols {
+		if col.defaultValue != "" {
+			db.log.Debugf("  boolean column: %s.%s (default: %s)", col.table, col.column, col.defaultValue)
+		} else {
+			db.log.Debugf("  boolean column: %s.%s (no default)", col.table, col.column)
+		}
+	}
+
+	if errorEncountered := db.prepareTables(boolCols); errorEncountered == true {
 		if promptToContinue() != true {
 			return fmt.Errorf("%s", "Stopping migration at user's request.")
 		}
@@ -189,7 +200,7 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 	db.log.Debugf("Import execution complete: %d/%d statements in %s", processedStmts, totalStmts, time.Since(start).Round(time.Second))
 
 	// Fix boolean columns that we converted before.
-	if errorEncountered := db.decodeBooleanColumns(); errorEncountered == true {
+	if errorEncountered := db.decodeBooleanColumns(boolCols); errorEncountered == true {
 		if promptToContinue() != true {
 			return fmt.Errorf("%s", "Stopping migration at user's request.")
 		}
@@ -204,28 +215,65 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 
 }
 
-// Change column types that expect boolean to integer so that we can get the data in.
-// We'll decode their values into booleans later.
-func (db *DB) prepareTables() (errorEncountered bool) {
-	for _, table := range TableChanges {
-		// for each column associated with the table,
-		// update the column type to be integer so that it's compatible with sqlite's 0/1 bool values
-		for _, column := range table.Columns {
-			// If the column has a default value associated with it, drop it.
-			if column.Default != "" {
-				stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", table.Table, column.Name)
-				db.log.Debugln("Executing: ", stmt)
-				if _, err := db.conn.Exec(stmt); err != nil {
-					if strings.Contains(err.Error(), "does not exist") {
-						db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
-					} else {
-						db.log.Warnf("%v %v", err.Error(), stmt)
-						errorEncountered = true
-					}
-				}
-			}
 
-			stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE integer USING %s::integer", table.Table, column.Name, column.Name)
+// boolColumn holds a PostgreSQL boolean column's location and default value.
+type boolColumn struct {
+	table        string // double-quoted identifier, e.g. "alert"
+	column       string // double-quoted identifier, e.g. "silenced"
+	defaultValue string // "true", "false", or "" when there is no default
+}
+
+// detectBooleanColumns queries PostgreSQL information_schema for all boolean columns
+// in the public schema. These columns require temporary integer conversion during
+// SQLite data import because SQLite stores booleans as 0 and 1.
+func (db *DB) detectBooleanColumns() ([]boolColumn, error) {
+	rows, err := db.conn.Query(`
+		SELECT table_name, column_name, column_default
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND data_type = 'boolean'
+		ORDER BY table_name, column_name
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("querying boolean columns: %w", err)
+	}
+	defer rows.Close()
+
+	var cols []boolColumn
+	for rows.Next() {
+		var tableName, columnName string
+		var columnDefault sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &columnDefault); err != nil {
+			return nil, fmt.Errorf("scanning boolean column: %w", err)
+		}
+		col := boolColumn{
+			table:  `"` + tableName + `"`,
+			column: `"` + columnName + `"`,
+		}
+		if columnDefault.Valid {
+			col.defaultValue = normalizeBoolDefault(columnDefault.String)
+		}
+		cols = append(cols, col)
+	}
+	return cols, rows.Err()
+}
+
+// normalizeBoolDefault converts a PostgreSQL column_default expression for a boolean
+// column (e.g. "false" or "'false'::boolean") into a plain "true" or "false" literal.
+func normalizeBoolDefault(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if idx := strings.Index(s, "::"); idx != -1 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	return strings.Trim(s, "'")
+}
+
+// prepareTables temporarily converts boolean columns to integer so that the
+// SQLite dump's 0/1 values can be inserted without type errors.
+func (db *DB) prepareTables(cols []boolColumn) (errorEncountered bool) {
+	for _, col := range cols {
+		if col.defaultValue != "" {
+			stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", col.table, col.column)
 			db.log.Debugln("Executing: ", stmt)
 			if _, err := db.conn.Exec(stmt); err != nil {
 				if strings.Contains(err.Error(), "does not exist") {
@@ -235,21 +283,41 @@ func (db *DB) prepareTables() (errorEncountered bool) {
 					errorEncountered = true
 				}
 			}
+		}
 
+		stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE integer USING %s::integer", col.table, col.column, col.column)
+		db.log.Debugln("Executing: ", stmt)
+		if _, err := db.conn.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "does not exist") {
+				db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
+			} else {
+				db.log.Warnf("%v %v", err.Error(), stmt)
+				errorEncountered = true
+			}
 		}
 	}
-
 	return
 }
 
-// Change columns back to boolean type by decoding their current values
-func (db *DB) decodeBooleanColumns() bool {
-
+// decodeBooleanColumns converts the temporarily-integer columns back to boolean
+// and restores any defaults that were dropped in prepareTables.
+func (db *DB) decodeBooleanColumns(cols []boolColumn) bool {
 	var errorEncountered bool
 
-	for _, table := range TableChanges {
-		for _, column := range table.Columns {
-			stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE boolean USING CASE WHEN %s = 0 THEN FALSE WHEN %s = 1 THEN TRUE ELSE NULL END", table.Table, column.Name, column.Name, column.Name)
+	for _, col := range cols {
+		stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE boolean USING CASE WHEN %s = 0 THEN FALSE WHEN %s = 1 THEN TRUE ELSE NULL END", col.table, col.column, col.column, col.column)
+		db.log.Debugln("Executing: ", stmt)
+		if _, err := db.conn.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "does not exist") {
+				db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
+			} else {
+				db.log.Warnf("%v %v", err.Error(), stmt)
+				errorEncountered = true
+			}
+		}
+
+		if col.defaultValue != "" {
+			stmt = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s", col.table, col.column, col.defaultValue)
 			db.log.Debugln("Executing: ", stmt)
 			if _, err := db.conn.Exec(stmt); err != nil {
 				if strings.Contains(err.Error(), "does not exist") {
@@ -259,23 +327,8 @@ func (db *DB) decodeBooleanColumns() bool {
 					errorEncountered = true
 				}
 			}
-
-			// If the column has a default value associated with it, drop it.
-			if column.Default != "" {
-				stmt = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s", table.Table, column.Name, column.Default)
-				db.log.Debugln("Executing: ", stmt)
-				if _, err := db.conn.Exec(stmt); err != nil {
-					if strings.Contains(err.Error(), "does not exist") {
-						db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
-					} else {
-						db.log.Warnf("%v %v", err.Error(), stmt)
-						errorEncountered = true
-					}
-				}
-			}
-
-		} // end column loop
-	} // end table loop
+		}
+	}
 
 	return errorEncountered
 }
