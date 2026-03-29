@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
+	"time"
 
 	// Postgres driver
 	_ "github.com/lib/pq"
@@ -107,7 +108,7 @@ func (db *DB) ClearTableRows() (int, int64, error) {
 }
 
 // ImportDump imports a SQL dump file.
-func (db *DB) ImportDump(dumpFile string) error {
+func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error {
 
 	promptToContinue := func() bool {
 		reader := bufio.NewReader(os.Stdin)
@@ -137,8 +138,25 @@ func (db *DB) ImportDump(dumpFile string) error {
 	}
 
 	sqlStmts := strings.Split(string(file), ";\n")
+	totalStmts := 0
+	for _, stmt := range sqlStmts {
+		if strings.TrimSpace(stmt) != "" {
+			totalStmts++
+		}
+	}
+
+	start := time.Now()
+	lastProgress := start
+	processedStmts := 0
+	progressEnabled := progressInterval > 0
 
 	for _, stmt := range sqlStmts {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		processedStmts++
+
 		if _, err := db.conn.Exec(stmt); err != nil {
 			// We can safely ignore "duplicate key value violates unique constraint" errors.
 			if strings.Contains(err.Error(), "duplicate key") {
@@ -156,7 +174,19 @@ func (db *DB) ImportDump(dumpFile string) error {
 				return fmt.Errorf("%v %v", err.Error(), stmt)
 			}
 		}
+
+		if progressEnabled && time.Since(lastProgress) >= progressInterval {
+			elapsed := time.Since(start).Round(time.Second)
+			progress := 0.0
+			if totalStmts > 0 {
+				progress = (float64(processedStmts) / float64(totalStmts)) * 100
+			}
+			db.log.Infof("⏳ Import progress: %d/%d statements (%.1f%%), elapsed %s", processedStmts, totalStmts, progress, elapsed)
+			lastProgress = time.Now()
+		}
 	}
+
+	db.log.Debugf("Import execution complete: %d/%d statements in %s", processedStmts, totalStmts, time.Since(start).Round(time.Second))
 
 	// Fix boolean columns that we converted before.
 	if errorEncountered := db.decodeBooleanColumns(); errorEncountered == true {

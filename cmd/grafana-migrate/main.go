@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"time"
 
 	"github.com/wbh1/grafana-sqlite-to-postgres/pkg/postgresql"
 	"github.com/wbh1/grafana-sqlite-to-postgres/pkg/sqlite"
@@ -17,6 +18,7 @@ var (
 	sqlitefile = app.Arg("sqlite-file", "Path to SQLite file being imported.").Required().File()
 	connstring = app.Arg("postgres-connection-string", "URL-format database connection string to use in the URL format (postgres://USERNAME:PASSWORD@HOST/DATABASE).").Required().String()
 	debug      = app.Flag("debug", "Enable debug level logging").Bool()
+	progress   = app.Flag("progress-interval-seconds", "How often to log import progress in seconds. Set to 0 to disable periodic updates.").Default("60").Int()
 )
 
 func main() {
@@ -104,7 +106,7 @@ func main() {
 
 	// Import the now-sanitized dump file into Postgres
 	log.Infoln("🚚 Importing dump file to Postgres (this may take a while)")
-	if err := db.ImportDump(dumpPath); err != nil {
+	if err := db.ImportDump(dumpPath, time.Duration(*progress)*time.Second); err != nil {
 		log.Fatalf("❌ %v - failed to import dump file to Postgres.", err)
 	}
 	log.Infoln("✅ Imported dump file to Postgres")
