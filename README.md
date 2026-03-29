@@ -26,6 +26,7 @@ Tested on:
 | MacOS          | 3.24.0         | 11.3             | 6.1.0+          |
 | CentOS 7/RHEL7 | 3.7.17         | 11.3             | 6.1.0+          |
 | Fedora 36      | 3.36.0         | 15.0             | 9.2.0           |
+| Ubuntu 24.04   | 3.46.1         | 16.13            | 11.6.14         |
 
 ## Usage
 ```
@@ -54,6 +55,9 @@ Args:
 - Improves SQLite to Postgres type compatibility during import:
   - Handles SQLite hex values for Postgres `BYTEA` columns.
   - Temporarily converts Postgres boolean columns for SQLite `0/1` import, then restores boolean types.
+
+### Batched inserts
+This functionality dramatically improves import speed - in my environment, 1.6 million rows were expected to take 1.5h to import before optimization. After the batching code was added, import completes in less than 2 minutes.
 
 ### Important behavior change
 This tool now performs a full data refresh of the target Grafana database tables before importing.
