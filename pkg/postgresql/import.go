@@ -31,6 +31,81 @@ func New(connString string, logger *logrus.Logger) (db DB, err error) {
 	return
 }
 
+// ClearTableRows deletes all rows from all tables in the public schema, except migration_log.
+// This ensures a clean slate before inserting records from the dump.
+// Returns the number of tables cleared and total rows affected.
+func (db *DB) ClearTableRows() (int, int64, error) {
+	// Query for all table names in the public schema
+	query := `
+		SELECT tablename 
+		FROM pg_tables 
+		WHERE schemaname = 'public'
+		ORDER BY tablename
+	`
+
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to query table names: %v", err)
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return 0, 0, fmt.Errorf("failed to scan table name: %v", err)
+		}
+		tables = append(tables, tableName)
+	}
+
+	if err = rows.Err(); err != nil {
+		return 0, 0, fmt.Errorf("error iterating table names: %v", err)
+	}
+
+	if len(tables) == 0 {
+		return 0, 0, nil
+	}
+
+	db.log.Debugf("Found %d tables in public schema", len(tables))
+
+	// Disable foreign key checks temporarily
+	if _, err := db.conn.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		db.log.Warnf("Could not defer constraints: %v", err)
+	}
+
+	tablesCleared := 0
+	var totalRowsAffected int64
+
+	for _, table := range tables {
+		// Skip migration_log table
+		if table == "migration_log" {
+			db.log.Debugf("Skipping migration_log table")
+			continue
+		}
+
+		deleteQuery := fmt.Sprintf("DELETE FROM \"%s\"", table)
+		result, err := db.conn.Exec(deleteQuery)
+		if err != nil {
+			db.log.Warnf("Could not delete from table %s: %v", table, err)
+			continue
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected > 0 {
+			db.log.Debugf("Deleted %d rows from %s", rowsAffected, table)
+			tablesCleared++
+			totalRowsAffected += rowsAffected
+		}
+	}
+
+	// Re-enable foreign key checks
+	if _, err := db.conn.Exec("SET CONSTRAINTS ALL IMMEDIATE"); err != nil {
+		db.log.Warnf("Could not restore constraints: %v", err)
+	}
+
+	return tablesCleared, totalRowsAffected, nil
+}
+
 // ImportDump imports a SQL dump file.
 func (db *DB) ImportDump(dumpFile string) error {
 
@@ -132,14 +207,6 @@ func (db *DB) prepareTables() (errorEncountered bool) {
 			}
 
 		}
-	}
-
-	// Delete the org that gets auto-generated the first time Grafana runs.
-	stmt := "DELETE FROM org WHERE id=1"
-	db.log.Debugln("Executing: ", stmt)
-	if _, err := db.conn.Exec(stmt); err != nil {
-		db.log.Errorf("%v %v", err.Error(), stmt)
-		errorEncountered = true
 	}
 
 	return

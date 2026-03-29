@@ -88,6 +88,13 @@ func main() {
 		log.Fatalf("❌ %v - failed to connect to Postgres database.", err)
 	}
 
+	// Clear all rows from tables before importing
+	tablesCleared, rowsDeleted, err := db.ClearTableRows()
+	if err != nil {
+		log.Fatalf("❌ %v - failed to clear table rows.", err)
+	}
+	log.Infof("✅ Cleared %d rows from %d tables (skipped migration_log)", rowsDeleted, tablesCleared)
+
 	// Import the now-sanitized dump file into Postgres
 	log.Infoln("🚚 Importing dump file to Postgres (this may take a while)")
 	if err := db.ImportDump(dumpPath); err != nil {
