@@ -108,8 +108,7 @@ func (db *DB) ClearTableRows() (int, int64, error) {
 }
 
 // ImportDump imports a SQL dump file.
-func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error {
-
+func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration, insertBatchSize int) error {
 	promptToContinue := func() bool {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("You seem to have encountered some errors. Would you still like to continue? [Y/n]: ")
@@ -160,29 +159,127 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 	lastProgress := start
 	processedStmts := 0
 	progressEnabled := progressInterval > 0
+	currentTable := ""
+	pendingBatchTable := ""
+	pendingBatchPrefix := ""
+	var pendingBatchValues []string
+	var pendingBatchStatements []string
+
+	var tx *sql.Tx
+	beginTx := func() error {
+		var beginErr error
+		tx, beginErr = db.conn.Begin()
+		if beginErr != nil {
+			return fmt.Errorf("failed to start import transaction: %w", beginErr)
+		}
+		return nil
+	}
+	commitTx := func() error {
+		if tx == nil {
+			return nil
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("failed to commit import transaction: %w", commitErr)
+		}
+		tx = nil
+		return nil
+	}
+
+	if err := beginTx(); err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	flushPendingBatch := func() error {
+		if len(pendingBatchStatements) == 0 {
+			return nil
+		}
+
+		if len(pendingBatchStatements) == 1 {
+			err := db.executeImportStatement(tx, pendingBatchStatements[0], true)
+			pendingBatchTable = ""
+			pendingBatchPrefix = ""
+			pendingBatchValues = nil
+			pendingBatchStatements = nil
+			return err
+		}
+
+		batchStmt := pendingBatchPrefix + strings.Join(pendingBatchValues, ",")
+		if err := db.executeImportStatement(tx, batchStmt, false); err != nil {
+			db.log.Debugf("Batch execution failed for %s (%d statements), falling back to single-row inserts: %v", pendingBatchTable, len(pendingBatchStatements), err)
+			for _, singleStmt := range pendingBatchStatements {
+				if singleErr := db.executeImportStatement(tx, singleStmt, true); singleErr != nil {
+					pendingBatchTable = ""
+					pendingBatchPrefix = ""
+					pendingBatchValues = nil
+					pendingBatchStatements = nil
+					return singleErr
+				}
+			}
+		}
+
+		pendingBatchTable = ""
+		pendingBatchPrefix = ""
+		pendingBatchValues = nil
+		pendingBatchStatements = nil
+		return nil
+	}
 
 	for _, stmt := range sqlStmts {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
 		}
+		if isTransactionControlStatement(stmt) {
+			continue
+		}
+
+		table := targetInsertTable(stmt)
+		if table != "" {
+			if currentTable != "" && currentTable != table {
+				if err := flushPendingBatch(); err != nil {
+					return err
+				}
+				if err := commitTx(); err != nil {
+					return err
+				}
+				if err := beginTx(); err != nil {
+					return err
+				}
+			}
+			currentTable = table
+		}
+
 		processedStmts++
 
-		if _, err := db.conn.Exec(stmt); err != nil {
-			// We can safely ignore "duplicate key value violates unique constraint" errors.
-			if strings.Contains(err.Error(), "duplicate key") {
-				continue
-			} else if strings.Contains(err.Error(), "is of type bytea but expression is of type text") {
-				// TODO(wbh1): This is absolutely horrible and I am ashamed of this code. Should figure out column types ahead of time.
-				db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", err.Error())
-				stmt = strings.Replace(
-					strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
-					"'utf-8'", "'hex'", 1)
-				if _, err := db.conn.Exec(stmt); err != nil {
-					return fmt.Errorf("%v %v", err.Error(), stmt)
+		batchTable, batchPrefix, batchValues, batchable := splitInsertStatementForBatch(stmt)
+		if batchable {
+			if len(pendingBatchStatements) > 0 && (pendingBatchTable != batchTable || pendingBatchPrefix != batchPrefix) {
+				if err := flushPendingBatch(); err != nil {
+					return err
 				}
-			} else {
-				return fmt.Errorf("%v %v", err.Error(), stmt)
+			}
+
+			pendingBatchTable = batchTable
+			pendingBatchPrefix = batchPrefix
+			pendingBatchValues = append(pendingBatchValues, batchValues)
+			pendingBatchStatements = append(pendingBatchStatements, stmt)
+
+			if len(pendingBatchStatements) >= insertBatchSize {
+				if err := flushPendingBatch(); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := flushPendingBatch(); err != nil {
+				return err
+			}
+			if err := db.executeImportStatement(tx, stmt, true); err != nil {
+				return err
 			}
 		}
 
@@ -197,7 +294,15 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 		}
 	}
 
+	if err := flushPendingBatch(); err != nil {
+		return err
+	}
+
 	db.log.Debugf("Import execution complete: %d/%d statements in %s", processedStmts, totalStmts, time.Since(start).Round(time.Second))
+
+	if err := commitTx(); err != nil {
+		return err
+	}
 
 	// Fix boolean columns that we converted before.
 	if errorEncountered := db.decodeBooleanColumns(boolCols); errorEncountered == true {
@@ -215,6 +320,153 @@ func (db *DB) ImportDump(dumpFile string, progressInterval time.Duration) error 
 
 }
 
+func (db *DB) executeImportStatement(tx *sql.Tx, stmt string, ignoreDuplicate bool) error {
+	if _, err := tx.Exec("SAVEPOINT import_stmt"); err != nil {
+		return fmt.Errorf("failed to create savepoint: %w", err)
+	}
+
+	if _, err := tx.Exec(stmt); err != nil {
+		if strings.Contains(err.Error(), "duplicate key") {
+			if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT import_stmt"); rbErr != nil {
+				return fmt.Errorf("failed to rollback savepoint after duplicate key: %w", rbErr)
+			}
+			if _, relErr := tx.Exec("RELEASE SAVEPOINT import_stmt"); relErr != nil {
+				return fmt.Errorf("failed to release savepoint after duplicate key: %w", relErr)
+			}
+			if ignoreDuplicate {
+				return nil
+			}
+			return fmt.Errorf("%v (statement starts with: %.200s)", err.Error(), stmt)
+		}
+
+		if strings.Contains(err.Error(), "is of type bytea but expression is of type text") {
+			db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", err.Error())
+			if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT import_stmt"); rbErr != nil {
+				return fmt.Errorf("failed to rollback savepoint after bytea type issue: %w", rbErr)
+			}
+			rewrittenStmt := rewriteByteaImportStatement(stmt)
+			if _, err := tx.Exec(rewrittenStmt); err != nil {
+				if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT import_stmt"); rbErr != nil {
+					return fmt.Errorf("failed to rollback savepoint after bytea retry failure: %w", rbErr)
+				}
+				if _, relErr := tx.Exec("RELEASE SAVEPOINT import_stmt"); relErr != nil {
+					return fmt.Errorf("failed to release savepoint after bytea retry failure: %w", relErr)
+				}
+				return fmt.Errorf("%v (statement starts with: %.200s)", err.Error(), rewrittenStmt)
+			}
+			if _, relErr := tx.Exec("RELEASE SAVEPOINT import_stmt"); relErr != nil {
+				return fmt.Errorf("failed to release savepoint after bytea retry: %w", relErr)
+			}
+			return nil
+		}
+
+		if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT import_stmt"); rbErr != nil {
+			return fmt.Errorf("failed to rollback savepoint after statement error: %w", rbErr)
+		}
+		if _, relErr := tx.Exec("RELEASE SAVEPOINT import_stmt"); relErr != nil {
+			return fmt.Errorf("failed to release savepoint after statement error: %w", relErr)
+		}
+		return fmt.Errorf("%v (statement starts with: %.200s)", err.Error(), stmt)
+	}
+
+	if _, err := tx.Exec("RELEASE SAVEPOINT import_stmt"); err != nil {
+		return fmt.Errorf("failed to release savepoint after success: %w", err)
+	}
+
+	return nil
+}
+
+func rewriteByteaImportStatement(stmt string) string {
+	return strings.Replace(
+		strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
+		"'utf-8'", "'hex'", 1)
+}
+
+// targetInsertTable extracts a normalized table identifier from INSERT statements.
+// It returns an empty string for non-INSERT statements.
+func targetInsertTable(stmt string) string {
+	trimmed := strings.TrimSpace(stmt)
+	if trimmed == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "insert into ") {
+		return ""
+	}
+
+	rest := strings.TrimSpace(trimmed[len("insert into "):])
+	if strings.HasPrefix(strings.ToLower(rest), "only ") {
+		rest = strings.TrimSpace(rest[len("only "):])
+	}
+	if rest == "" {
+		return ""
+	}
+
+	tableEnd := len(rest)
+	for i, r := range rest {
+		if r == ' ' || r == '\t' || r == '\n' || r == '(' {
+			tableEnd = i
+			break
+		}
+	}
+
+	table := strings.TrimSpace(rest[:tableEnd])
+	table = strings.ReplaceAll(table, `"`, "")
+	return strings.ToLower(table)
+}
+
+func splitInsertStatementForBatch(stmt string) (table string, prefix string, values string, ok bool) {
+	table = targetInsertTable(stmt)
+	if table == "" {
+		return "", "", "", false
+	}
+
+	trimmed := strings.TrimSpace(stmt)
+	lower := strings.ToLower(trimmed)
+	valuesIndex := strings.Index(lower, " values")
+	if valuesIndex == -1 {
+		return "", "", "", false
+	}
+
+	prefix = trimmed[:valuesIndex+len(" values")]
+	values = strings.TrimSpace(trimmed[valuesIndex+len(" values"):])
+	if !strings.HasPrefix(values, "(") {
+		return "", "", "", false
+	}
+
+	return table, prefix, values, true
+}
+
+func isTransactionControlStatement(stmt string) bool {
+	trimmed := strings.TrimSpace(stmt)
+	if trimmed == "" {
+		return false
+	}
+
+	lower := strings.ToLower(strings.TrimSuffix(trimmed, ";"))
+	fields := strings.Fields(lower)
+	if len(fields) == 0 {
+		return false
+	}
+
+	if len(fields) == 1 {
+		switch fields[0] {
+		case "begin", "commit", "rollback", "end":
+			return true
+		}
+	}
+
+	if len(fields) == 2 && (fields[0] == "begin" || fields[0] == "end") && fields[1] == "transaction" {
+		return true
+	}
+
+	if len(fields) == 2 && fields[0] == "rollback" && fields[1] == "transaction" {
+		return true
+	}
+
+	return false
+}
 
 // boolColumn holds a PostgreSQL boolean column's location and default value.
 type boolColumn struct {

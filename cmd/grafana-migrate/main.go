@@ -19,6 +19,7 @@ var (
 	connstring = app.Arg("postgres-connection-string", "URL-format database connection string to use in the URL format (postgres://USERNAME:PASSWORD@HOST/DATABASE).").Required().String()
 	debug      = app.Flag("debug", "Enable debug level logging").Bool()
 	progress   = app.Flag("progress-interval-seconds", "How often to log import progress in seconds. Set to 0 to disable periodic updates.").Default("60").Int()
+	batchSize  = app.Flag("insert-batch-size", "How many same-shape INSERT statements to combine into one multi-row INSERT.").Default("200").Int()
 )
 
 func main() {
@@ -106,7 +107,7 @@ func main() {
 
 	// Import the now-sanitized dump file into Postgres
 	log.Infoln("🚚 Importing dump file to Postgres (this may take a while)")
-	if err := db.ImportDump(dumpPath, time.Duration(*progress)*time.Second); err != nil {
+	if err := db.ImportDump(dumpPath, time.Duration(*progress)*time.Second, *batchSize); err != nil {
 		log.Fatalf("❌ %v - failed to import dump file to Postgres.", err)
 	}
 	log.Infoln("✅ Imported dump file to Postgres")
