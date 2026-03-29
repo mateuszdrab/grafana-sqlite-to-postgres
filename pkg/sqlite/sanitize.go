@@ -10,18 +10,18 @@ import (
 
 // Sanitize cleans up a SQLite dump file to prep it for import into Postgres.
 func Sanitize(dumpFile string) error {
-	// Change ` to "
-	re := regexp.MustCompile("`")
 	data, err := ioutil.ReadFile(dumpFile)
 	if err != nil {
 		return err
 	}
-	sanitized := re.ReplaceAll(data, []byte("\""))
+	// Convert SQLite identifier quotes (`name`) to Postgres style ("name"),
+	// but preserve backticks that are part of string literal values.
+	sanitized := normalizeBackticksOutsideStringLiterals(data)
 
 	// Remove SQLite-specific PRAGMA statements
 	// and statements that start with BEGIN
 	// and statements pertaining to the sqlite_sequence table.
-	re = regexp.MustCompile(`(?m)[\r\n]?^(PRAGMA.*;|BEGIN.*;|.*sqlite_sequence.*;)$`)
+	re := regexp.MustCompile(`(?m)[\r\n]?^(PRAGMA.*;|BEGIN.*;|.*sqlite_sequence.*;)$`)
 	sanitized = re.ReplaceAll(sanitized, nil)
 
 	// Ensure there are quotes around table names to avoid using reserved table names like user.
@@ -29,6 +29,46 @@ func Sanitize(dumpFile string) error {
 	sanitized = re.ReplaceAll(sanitized, []byte(`$1 "$2" $3`))
 
 	return ioutil.WriteFile(dumpFile, sanitized, 0644)
+}
+
+// normalizeBackticksOutsideStringLiterals converts backticks to double quotes
+// only when they are not inside single-quoted SQL string literals.
+func normalizeBackticksOutsideStringLiterals(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+
+	out := make([]byte, 0, len(data))
+	inString := false
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+
+		if b == '\'' {
+			out = append(out, b)
+			if inString {
+				// SQLite escapes single quotes inside strings as doubled quotes: ''
+				if i+1 < len(data) && data[i+1] == '\'' {
+					out = append(out, data[i+1])
+					i++
+					continue
+				}
+				inString = false
+			} else {
+				inString = true
+			}
+			continue
+		}
+
+		if b == '`' && !inString {
+			out = append(out, '"')
+			continue
+		}
+
+		out = append(out, b)
+	}
+
+	return out
 }
 
 // CustomSanitize allows you to expand upon the default Sanitize function
