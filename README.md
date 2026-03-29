@@ -34,8 +34,10 @@ usage: Grafana SQLite to Postgres Migrator [<flags>] <sqlite-file> <postgres-con
 A command-line application to migrate Grafana data from SQLite to Postgres.
 
 Flags:
-  --help       Show context-sensitive help (also try --help-long and --help-man).
-  --dump=/tmp  Directory path where the sqlite dump should be stored.
+  --help                           Show context-sensitive help (also try --help-long and --help-man).
+  --dump=/tmp                      Directory path where the sqlite dump should be stored.
+  --debug                          Enable debug level logging.
+  --progress-interval-seconds=60   How often to log import progress in seconds. Set to 0 to disable periodic updates.
 
 Args:
   <sqlite-file>                 Path to SQLite file being imported.
