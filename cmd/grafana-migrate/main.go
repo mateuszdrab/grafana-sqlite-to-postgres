@@ -62,6 +62,13 @@ func main() {
 	}
 	log.Infoln("✅ sqlite3 dump sanitized")
 
+	// Inject explicit column names into INSERT statements so that values are
+	// mapped correctly when Postgres column order differs from SQLite.
+	if err := sqlite.InjectColumnNames(f.Name(), dumpPath); err != nil {
+		log.Fatalf("❌ %v - failed to inject column names into dump file.", err)
+	}
+	log.Infoln("✅ Column names injected into INSERT statements")
+
 	// Don't bother adding anything to the migration_log table.
 	if err := sqlite.CustomSanitize(dumpPath, `(?msU)[\r\n]+^.*"migration_log.*;$`, nil); err != nil {
 		log.Fatalf("❌ %v - failed to perform additional sanitizing of the dump file.", err)

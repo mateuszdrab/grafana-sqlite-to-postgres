@@ -3,7 +3,9 @@ package sqlite
 import (
 	"fmt"
 	"io/ioutil"
+	"os/exec"
 	"regexp"
+	"strings"
 )
 
 // Sanitize cleans up a SQLite dump file to prep it for import into Postgres.
@@ -42,6 +44,80 @@ func CustomSanitize(dumpFile string, regex string, replacement []byte) error {
 
 	return ioutil.WriteFile(dumpFile, sanitized, 0644)
 
+}
+
+// InjectColumnNames modifies INSERT statements in a dump file to include
+// explicit column names sourced from the SQLite database. This ensures values
+// are mapped to the correct Postgres columns even when column order differs.
+func InjectColumnNames(dbFile string, dumpFile string) error {
+	data, err := ioutil.ReadFile(dumpFile)
+	if err != nil {
+		return err
+	}
+
+	// Find all unique table names from INSERT statements (after Sanitize, format
+	// is: INSERT INTO "tablename" VALUES)
+	tableRe := regexp.MustCompile(`(?m)^INSERT INTO "(\w+)" VALUES`)
+	tableSet := make(map[string]struct{})
+	for _, m := range tableRe.FindAllSubmatch(data, -1) {
+		tableSet[string(m[1])] = struct{}{}
+	}
+
+	if len(tableSet) == 0 {
+		return nil
+	}
+
+	// Build column list string for each table
+	tableColLists := make(map[string]string)
+	for table := range tableSet {
+		cols, err := getTableColumns(dbFile, table)
+		if err != nil {
+			return fmt.Errorf("getting columns for table %s: %w", table, err)
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		quoted := make([]string, len(cols))
+		for i, c := range cols {
+			quoted[i] = `"` + c + `"`
+		}
+		tableColLists[table] = "(" + strings.Join(quoted, ", ") + ")"
+	}
+
+	// Inject column names: INSERT INTO "t" VALUES -> INSERT INTO "t" (cols) VALUES
+	content := tableRe.ReplaceAllFunc(data, func(match []byte) []byte {
+		sub := tableRe.FindSubmatch(match)
+		table := string(sub[1])
+		colList, ok := tableColLists[table]
+		if !ok {
+			return match
+		}
+		return []byte(`INSERT INTO "` + table + `" ` + colList + ` VALUES`)
+	})
+
+	return ioutil.WriteFile(dumpFile, content, 0644)
+}
+
+// getTableColumns returns column names for a SQLite table in their defined order
+// by querying PRAGMA table_info.
+func getTableColumns(dbFile string, table string) ([]string, error) {
+	cmd := exec.Command("sqlite3", dbFile, fmt.Sprintf(`PRAGMA table_info("%s");`, table))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var cols []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// PRAGMA table_info output: cid|name|type|notnull|dflt_value|pk
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) >= 2 {
+			cols = append(cols, parts[1])
+		}
+	}
+	return cols, nil
 }
 
 // RemoveCreateStatements takes all the CREATE statements out of a dump
